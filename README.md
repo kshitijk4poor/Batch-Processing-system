@@ -1,450 +1,182 @@
-# Batch Processing System Specification
+## Batch Processing API Specification
 
-## Overview
-A configurable batch processing system that retrieves MongoDB documents with "pending" status, processes them through OpenAI's batch API, and updates the documents with results according to configurable templates. The system offers flexible document schema configuration through Python code.
+### 1. Overview
 
-## Requirements
+This document specifies an API endpoint and background processing system designed to handle batch processing of MongoDB documents using the OpenAI Batch API. The system accepts a JSONL file containing requests, validates it, submits it to OpenAI, polls for completion, validates the results against a user-provided schema, and updates the original MongoDB documents with the outcomes.
 
-### Functional Requirements
-1. Query MongoDB for documents with "ai_status" = "pending" (field name configurable)
-2. Process these documents in configurable batches using OpenAI's batch API
-3. Update document status during processing (status field and values configurable)
-4. Append API responses to a configurable response field with configurable structure
-5. Update final document status to configurable completion values
-6. Implement comprehensive logging of all operations
-7. Send notifications for batch completion or failure
-8. Support configurable retry attempts with exponential backoff for failures
+### 2. Core Requirements
 
-### Non-Functional Requirements
-1. Handle thousands of documents efficiently
-2. Implement rate limiting and backoff strategies
-3. Provide clear documentation and usage examples
-4. Ensure thread safety for concurrent operations
+*   Accept batch processing requests via an HTTP API endpoint.
+*   Validate input JSONL files against OpenAI Batch API format and ensure model consistency.
+*   Validate a user-provided JSON Schema for output processing.
+*   Interact with OpenAI API to upload files and manage batch jobs.
+*   Track the status of submitted batch jobs persistently.
+*   Periodically poll OpenAI for batch job status updates.
+*   Upon completion, retrieve results, validate AI response content against the user-provided schema.
+*   Update source MongoDB documents with validated results or failure status.
+*   Implement robust logging for observability.
+*   Handle transient errors gracefully with retries.
 
-## Architecture
+### 3. API Endpoint
 
-### Core Components
-1. **Config Manager**: Handles configuration from Python modules and environment variables
-2. **Template Manager**: Manages prompt and response templates
-3. **Database Connector**: MongoDB interface with configurable schema mapping
-4. **Batch Processor**: Core component that manages OpenAI batch API interactions
-5. **Status Manager**: Tracks and updates document statuses
-6. **Notification System**: Sends alerts for batch completions and failures
-7. **Logger**: Records detailed system operations
-
-### Data Flow
-1. Retrieve pending documents from MongoDB using configurable query
-2. Apply prompt template to generate user messages
-3. Generate JSONL batches for OpenAI processing
-4. Submit batches to OpenAI API
-5. Poll for batch completion
-6. Process results using response template
-7. Update documents with responses and status
-
-## Data Schemas
-
-### Schema Configuration (Python Module)
-```python
-from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List
-
-class StatusConfig(BaseModel):
-    """Define status field and values for tracking document processing."""
-    field_name: str = "ai_status"
-    pending_value: str = "pending"
-    in_progress_value: str = "in_progress"
-    completed_value: str = "completed"
-    failed_value: str = "failed"
-
-class SchemaConfig(BaseModel):
-    """Define MongoDB document schema configuration."""
-    status: StatusConfig = Field(default_factory=StatusConfig)
-    response_field: str = "event_response"
-    response_date_field: str = "created_date"
-    response_content_field: str = "talking_points"
-    document_id_field: str = "_id"
-    processing_info_field: str = "processing_info"
-    
-    # Query template for finding documents to process
-    query_template: Dict[str, Any] = Field(default_factory=lambda: {"ai_status": "pending"})
-    
-    # Update template for marking documents as in progress
-    update_template: Dict[str, Any] = Field(default_factory=lambda: {
-        "$set": {"ai_status": "in_progress"}
-    })
-    
-    # Template for adding a new response to the document
-    response_template: Dict[str, Any] = Field(default_factory=lambda: {
-        "$push": {
-            "event_response": {
-                "talking_points": "{{response_content}}",
-                "created_date": "{{current_date}}"
-            }
-        },
-        "$set": {"ai_status": "completed"}
-    })
-
-class DocumentFields(BaseModel):
-    """Define fields to extract from documents for prompts."""
-    field_map: Dict[str, str] = Field(default_factory=dict)
-    
-    # Optional preprocessing functions for fields
-    preprocess_functions: Dict[str, str] = Field(default_factory=dict)
-```
-
-### Configuration Module Structure (config.py)
-```python
-import os
-from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
-
-class DatabaseConfig(BaseModel):
-    """MongoDB database configuration."""
-    connection_string: str = Field(default_factory=lambda: os.getenv("MONGODB_URI", ""))
-    database_name: str = Field(default_factory=lambda: os.getenv("MONGODB_DB", ""))
-    collection_name: str = Field(default_factory=lambda: os.getenv("MONGODB_COLLECTION", ""))
-
-class OpenAIConfig(BaseModel):
-    """OpenAI API configuration."""
-    api_key: str = Field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
-    model: str = Field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
-    temperature: float = Field(default_factory=lambda: float(os.getenv("OPENAI_TEMP", "0.1")))
-    max_tokens: Optional[int] = Field(default_factory=lambda: int(os.getenv("OPENAI_MAX_TOKENS", "500")))
-    response_format: Optional[dict] = None
-
-class BatchConfig(BaseModel):
-    """Batch processing configuration."""
-    batch_size: int = Field(default_factory=lambda: int(os.getenv("BATCH_SIZE", "100")))
-    completion_window: str = Field(default_factory=lambda: os.getenv("COMPLETION_WINDOW", "24h"))
-    poll_interval: int = Field(default_factory=lambda: int(os.getenv("POLL_INTERVAL", "300")))
-    endpoint: str = Field(default="/v1/chat/completions")
-    max_retries: int = Field(default_factory=lambda: int(os.getenv("MAX_RETRIES", "3")))
-
-class PromptConfig(BaseModel):
-    """Prompt configuration."""
-    system_prompt: str = Field(default_factory=lambda: os.getenv("SYSTEM_PROMPT", ""))
-    user_prompt_template: str = Field(default_factory=lambda: os.getenv("USER_PROMPT_TEMPLATE", ""))
-
-class NotificationConfig(BaseModel):
-    """Notification configuration."""
-    webhook_url: Optional[str] = Field(default_factory=lambda: os.getenv("NOTIFICATION_WEBHOOK", ""))
-    email: Optional[str] = Field(default_factory=lambda: os.getenv("NOTIFICATION_EMAIL", ""))
-
-# Import schema configuration (example)
-from schema_config import SchemaConfig, DocumentFields
-
-class AppConfig(BaseModel):
-    """Main application configuration."""
-    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
-    openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
-    batch: BatchConfig = Field(default_factory=BatchConfig)
-    prompt: PromptConfig = Field(default_factory=PromptConfig)
-    notification: NotificationConfig = Field(default_factory=NotificationConfig)
-    schema: SchemaConfig = Field(default_factory=SchemaConfig)
-    document_fields: DocumentFields = Field(default_factory=DocumentFields)
-    
-    @classmethod
-    def from_env(cls) -> "AppConfig":
-        """Load configuration from environment variables."""
-        return cls()
-```
-
-## Schema Configuration Example
-```python
-# schema_config.py - Example for medical documents
-from pydantic import BaseModel, Field
-from typing import Dict, Any
-
-class StatusConfig(BaseModel):
-    field_name: str = "ai_status"
-    pending_value: str = "pending"
-    in_progress_value: str = "in_progress"
-    completed_value: str = "completed"
-    failed_value: str = "failed"
-
-class SchemaConfig(BaseModel):
-    status: StatusConfig = Field(default_factory=StatusConfig)
-    response_field: str = "event_response"
-    response_date_field: str = "created_date"
-    response_content_field: str = "talking_points"
-    document_id_field: str = "document_id"
-    
-    # Query to find documents to process
-    query_template: Dict[str, Any] = Field(default_factory=lambda: {
-        "ai_status": "pending"
-    })
-    
-    # Update to mark as in progress
-    update_template: Dict[str, Any] = Field(default_factory=lambda: {
-        "$set": {"ai_status": "in_progress"}
-    })
-    
-    # Template for adding a response
-    response_template: Dict[str, Any] = Field(default_factory=lambda: {
-        "$push": {
-            "event_response": {
-                "talking_points": "{{response_content}}",
-                "created_date": "{{current_date}}"
-            }
-        },
-        "$set": {"ai_status": "completed"}
-    })
-
-class DocumentFields(BaseModel):
-    # Map document fields to template variables
-    field_map: Dict[str, str] = Field(default_factory=lambda: {
-        "patient_name": "patient_details.first_name",
-        "patient_age": "patient_details.patient_age",
-        "doctor_name": "medical_details.doctor_name",
-        "document_id": "document_id"
-    })
-```
-
-## JSONL Batch Format
-```json
-{
-  "custom_id": "doc_id_123",
-  "method": "POST",
-  "url": "/v1/chat/completions",
-  "body": {
-    "model": "configured_model",
-    "temperature": 0.1,
-    "max_tokens": 500,
-    "messages": [
-      {
-        "role": "system",
-        "content": "configured_system_prompt"
-      },
-      {
-        "role": "user",
-        "content": "templated_content_from_document"
-      }
-    ]
-  }
-}
-```
-
-## Template System
-
-### Prompt Template
-Uses a Jinja2-like syntax to insert document fields into prompts:
-```
-Your patient {{patient_name}} has visited on {{last_visit_date}}. 
-Their medical details show {{doctor_name}} has recommended treatment.
-```
-
-### Response Processing
-Python functions to transform API responses before database updates:
-```python
-def process_response(response, document):
-    """Transform API response to match required document structure."""
-    # Extract content from OpenAI response
-    content = response["choices"][0]["message"]["content"]
-    
-    # Parse content as needed (e.g., from JSON)
-    import json
-    try:
-        content = json.loads(content)
-    except:
-        pass
-    
-    # Create the response object based on schema configuration
-    return {
-        "_id": document["document_id"],
-        "patient_type": "ip",  # Default or from document
-        "talking_points": content
-    }
-```
-
-## Error Handling Strategy
-1. Implement structured error types:
-   - `ConnectionError`: Database and API connection issues
-   - `ValidationError`: Data validation failures
-   - `ProcessingError`: Batch processing failures
-   - `TimeoutError`: Polling timeout issues
-   - `TemplateError`: Template rendering or parsing errors
-
-2. Error recovery:
-   - Documents with processing errors return to "pending" state (if under retry limit)
-   - Documents exceeding retry limit marked as "failed"
-   - Implement exponential backoff for rate limit errors
-
-3. Document error tracking:
-   - Store error details in configurable error field
-   - Include timestamp and attempt count
-
-## Logging
-1. Implement structured logging with:
-   - Timestamp
-   - Operation type (query, process, update)
-   - Batch ID
-   - Document count
-   - Status
-   - Error details (when applicable)
-
-2. Log levels:
-   - INFO: General operation status
-   - ERROR: Operation failures
-   - DEBUG: Detailed processing information
-
-## Notification System
-1. Send webhook notifications for:
-   - Batch completion
-   - Batch failure
-   - Retry attempts
-
-2. Notification payload:
-   - Batch ID
-   - Status
-   - Document count (total/succeeded/failed)
-   - Timestamp
-   - Error summary (if applicable)
-
-## Implementation Plan
-
-### Phase 1: Core Infrastructure
-1. Set up configuration management
-2. Implement MongoDB connector
-3. Create template system for prompts and responses
-
-### Phase 2: Batch Processing
-1. Implement OpenAI batch API client
-2. Create status polling and management
-3. Develop result processing and storage
-
-### Phase 3: Resilience & Monitoring
-1. Add retry mechanisms
-2. Implement logging
-3. Add notification system
-
-### Phase 4: Testing & Documentation
-1. Create unit and integration tests
-2. Prepare documentation
-3. Develop usage examples
-
-## Testing Strategy
-
-### Unit Tests
-1. Test configuration loading
-2. Test MongoDB operations
-3. Test template rendering and parsing
-4. Test status updates
-5. Test error handling
-
-### Integration Tests
-1. Test end-to-end flow with mock OpenAI API
-2. Test error recovery
-3. Test template application with real documents
-
-### Performance Tests
-1. Test with varying batch sizes
-2. Measure processing throughput
-3. Test with simulated API delays
-
-## Usage Example
-```python
-from batch_processor import BatchProcessor
-from my_custom_schema import medical_schema_config
-
-# Initialize with default configuration and custom schema
-processor = BatchProcessor(schema_config=medical_schema_config)
-
-# Process pending documents
-result = processor.process_pending_documents()
-
-# Check processing stats
-print(f"Processed: {result.total_processed}")
-print(f"Succeeded: {result.succeeded}")
-print(f"Failed: {result.failed}")
-
-# Example with custom response processor
-def custom_response_processor(response, document):
-    """Custom function to process responses."""
-    content = response["choices"][0]["message"]["content"]
-    return {
-        "_id": document["document_id"],
-        "patient_type": document.get("patient_details", {}).get("patient_type", "unknown"),
-        "talking_points": {
-            "Benefits": content.get("benefits", []),
-            "Condition": content.get("condition", ""),
-            "IfDelayed": content.get("if_delayed", []),
-            "Recommendation": content.get("recommendation", "")
+*   **Path:** `POST /process-batch`
+*   **Authentication:** None. The endpoint is publicly accessible.
+*   **Request Format:** `multipart/form-data` containing the following fields:
+    *   `jsonl_file`: (Required) The `.jsonl` file where each line represents a single OpenAI API request (e.g., for `/v1/chat/completions`). Must adhere to OpenAI batch input format.
+    *   `output_schema_json`: (Required) A string containing a valid JSON Schema definition. This schema will be used to validate the `content` part of the AI's response before updating the target MongoDB document.
+    *   `mongodb_uri`: (Required) The MongoDB connection string (URI) for the database containing the documents to be processed and updated.
+    *   `collection_name`: (Required) The name of the collection within the specified MongoDB database.
+*   **Success Response:**
+    *   **Status Code:** `202 Accepted`
+    *   **Body:**
+        ```json
+        {
+          "job_id": "<internal_job_id>" // The MongoDB ObjectId of the created record in the batch_jobs collection
         }
-    }
+        ```
+*   **Error Response (Validation):**
+    *   **Status Code:** `400 Bad Request`
+    *   **Body:**
+        ```json
+        {
+          "error": "Validation Failed",
+          "details": [
+            {
+              "type": "<error_type>", // e.g., "jsonl_format_error", "model_mismatch", "schema_validation_error", "db_connection_error", "custom_id_not_found"
+              "line": <line_number>, // Optional: Line number in JSONL file if applicable
+              "message": "<Specific error message>",
+              "context": { /* Optional: Further details, e.g., Pydantic validation output */ }
+            }
+            // ... potentially more error objects ...
+          ]
+        }
+        ```
 
-processor.set_response_processor(custom_response_processor)
-processor.process_pending_documents()
-```
+### 4. Input Validation (Performed by API Endpoint)
 
-## File Structure
-```
-batch_processing/
-├── config.py              # Configuration management
-├── schema_config.py       # Default schema configuration
-├── db.py                  # Database connector
-├── processor.py           # Main batch processor
-├── templates.py           # Template system
-├── models.py              # Data models
-├── notifier.py            # Notification system
-├── logger.py              # Logging utilities
-├── errors.py              # Error handling
-├── utils.py               # Utility functions
-├── tests/                 # Test suite
-│   ├── test_processor.py
-│   ├── test_templates.py
-│   └── test_db.py
-├── examples/              # Usage examples
-│   ├── basic_processing.py
-│   ├── custom_schema.py
-│   └── custom_processor.py
-├── schema_examples/       # Example schema configurations
-│   ├── medical_schema.py
-│   └── customer_service_schema.py
-└── README.md              # Documentation
-```
+1.  **JSONL File:**
+    *   Each line must be a valid JSON object.
+    *   Each JSON object must contain the keys: `custom_id` (string), `method` (string, must be "POST"), `url` (string, e.g., "/v1/chat/completions"), `body` (object).
+    *   The `body` object must conform to the requirements of the specified OpenAI `url`.
+    *   The `model` specified within the `body` object must be the same for all lines in the file. The model is determined from the first line.
+2.  **Output Schema:**
+    *   The `output_schema_json` string must parse as valid JSON and represent a valid JSON Schema structure.
+3.  **MongoDB:**
+    *   The provided `mongodb_uri` must be valid and allow connection.
+    *   The specified `collection_name` must exist (or be creatable, TBD - assume exists for now).
+    *   Each `custom_id` within the JSONL file must correspond to the `_id` of an existing document within the specified MongoDB collection.
 
-## Implementation Timeline
+### 5. Backend Processing Workflow
 
-### Week 1: Core Components
-- Day 1-2: Configuration system and schema setup
-- Day 3-4: MongoDB connector implementation
-- Day 5: Template system implementation
+1.  **API Request Handling (`POST /process-batch`):**
+    *   Receive `multipart/form-data`.
+    *   Perform all validations outlined in Section 4. If any validation fails, return `400 Bad Request` immediately.
+    *   Upload the validated `jsonl_file` to OpenAI Files API with `purpose="batch"`. Obtain the `input_file_id`.
+    *   Create an OpenAI Batch job using the `input_file_id`, the endpoint derived from the JSONL `url`, and `completion_window="24h"`. Obtain the `openai_batch_id`.
+    *   Create a new document in the `batch_jobs` MongoDB collection (see Section 6) storing `openai_batch_id`, `input_file_id`, `output_schema_json`, `mongodb_uri`, `collection_name`, `model`, initial status (`submitted`), and timestamps. Obtain the internal `_id` (`job_id`).
+    *   Connect to the target MongoDB using `mongodb_uri`. For each `custom_id` in the input JSONL, update the corresponding document in `collection_name`, setting its status field (e.g., `ai_status`) to an "in progress" value (e.g., `in_progress`).
+    *   Return `202 Accepted` with the internal `job_id`.
 
-### Week 2: Processing Pipeline
-- Day 1-2: Batch creation and JSONL generation
-- Day 3-4: OpenAI API integration and polling
-- Day 5: Response processing and document updates
+2.  **Polling and Result Processing (Separate Scheduled Script):**
+    *   A separate script/service runs periodically (triggered by e.g., Google Cloud Scheduler).
+    *   Query the `batch_jobs` collection for documents where `status` is not `completed` or `failed`.
+    *   For each active job:
+        *   Attempt to retrieve the batch status from OpenAI using `openai_batch_id` (`client.batches.retrieve(...)`). Implement retries (up to 3 attempts with exponential backoff) for transient network/API errors. If retries fail, log the error and proceed to the next job (relying on the next scheduled run).
+        *   Update the `openai_status` and `updated_at` fields in the `batch_jobs` document.
+        *   **If `openai_status` is `completed`:**
+            *   Update `batch_jobs` status to `processing`.
+            *   Retrieve `output_file_id` and `error_file_id` from the OpenAI batch object and store them in the `batch_jobs` document.
+            *   Download the content of the `output_file_id` from OpenAI Files API (with retries).
+            *   If `error_file_id` exists, download its content (with retries).
+            *   Retrieve `output_schema_json`, `mongodb_uri`, `collection_name` from the `batch_jobs` document.
+            *   Connect to the target MongoDB.
+            *   Parse the output file JSONL. For each result line:
+                *   Identify the `custom_id`.
+                *   Find the corresponding document in the target collection.
+                *   Check if the line contains a `response` or an `error`.
+                *   **If `response`:**
+                    *   Extract the primary AI response content (e.g., `response.body.choices[0].message.content`).
+                    *   Validate this extracted content against the `output_schema_json`.
+                    *   **If valid:** Perform a MongoDB update on the target document: `$push` an object `{ "event_response": <validated_content>, "updated": <current_timestamp> }` into the `event_response` array field, and `$set` the status field (e.g., `ai_status`) to `completed`. Log success (INFO).
+                    *   **If invalid:** Perform a MongoDB update on the target document: `$set` the status field (e.g., `ai_status`) to `failed`. *Do not* modify the `event_response` field. Log the validation failure (WARN) including `custom_id` and validation error details.
+                *   **If `error`:** Perform a MongoDB update on the target document: `$set` the status field (e.g., `ai_status`) to `failed`. Log the OpenAI error details (WARN) including `custom_id`.
+            *   Log any content retrieved from the `error_file_id` (WARN).
+            *   Update the `batch_jobs` document status to `completed`.
+        *   **If `openai_status` is `failed` or `expired`:**
+            *   Update the `batch_jobs` document status to `failed`.
+            *   (Optional/Recommended) Consider iterating through associated `custom_id`s (perhaps stored temporarily or queried) and updating their status in the target collection to `failed`. Log the event (WARN).
+        *   **If `openai_status` is `cancelling` or `cancelled`:**
+            *   Update the `batch_jobs` document status accordingly. Log the event (INFO).
+        *   **Other statuses (`validating`, `in_progress`, `finalizing`):** Simply update `openai_status` in `batch_jobs` and wait for the next polling cycle.
 
-### Week 3: Resilience & Quality
-- Day 1-2: Error handling and retries
-- Day 3: Logging system
-- Day 4: Notification system
-- Day 5: Unit tests
+### 6. Data Schemas
 
-### Week 4: Testing & Documentation
-- Day 1-2: Integration tests
-- Day 3: Performance tests
-- Day 4: Documentation
-- Day 5: Example implementations and usage guides
+*   **`batch_jobs` MongoDB Collection Schema:**
+    *   `_id`: `ObjectId` (Primary Key, the internal `job_id`)
+    *   `openai_batch_id`: `String` (Indexed)
+    *   `input_file_id`: `String`
+    *   `output_file_id`: `String` (Nullable)
+    *   `error_file_id`: `String` (Nullable)
+    *   `status`: `String` (e.g., `submitted`, `processing`, `completed`, `failed`) (Indexed)
+    *   `openai_status`: `String` (Nullable, mirrors OpenAI status)
+    *   `output_schema_json`: `String`
+    *   `mongodb_uri`: `String`
+    *   `collection_name`: `String`
+    *   `model`: `String`
+    *   `created_at`: `Timestamp`
+    *   `updated_at`: `Timestamp`
 
-## Dependencies
-- Python 3.8+
-- OpenAI Python SDK 1.6.0+
-- PyMongo 4.3.0+
-- Pydantic 2.0.0+
-- Jinja2 (or similar templating)
-- Requests
-- python-dotenv
+*   **Target MongoDB Document Update Structure:**
+    *   An **array** field named `event_response` will be added/updated.
+    *   Objects pushed into this array will have the structure:
+        ```json
+        {
+          "event_response": <validated_content_matching_output_schema>,
+          "updated": <timestamp_of_processing>
+        }
+        ```
+    *   A status field (e.g., `ai_status`: `String`) will be updated (e.g., to `in_progress`, `completed`, `failed`).
 
-## Deployment Considerations
-1. Run as a scheduled job for periodic processing
-2. Implement locking to prevent duplicate processing
-3. Consider containerization for deployment
-4. Set up monitoring for system health
-5. Store templates in separate files for easy management
+### 7. Configuration
 
-This comprehensive specification provides a complete roadmap for implementing the batch processing system with configurable document schemas, prompts, and response templates. A developer can use this specification to implement a robust, configurable, and maintainable system that meets all the requirements discussed. 
+*   `OPENAI_API_KEY`: Provided via environment variable. Read by both API endpoint and polling script.
+*   `MONGODB_URI`: Provided per-request via `multipart/form-data`.
+*   `collection_name`: Provided per-request via `multipart/form-data`.
+*   (Polling Script) `POLL_INTERVAL`: Configurable interval for the scheduler (e.g., every 5 minutes).
+*   (Polling Script) `RETRY_MAX_ATTEMPTS`: `3`
+*   (Target Documents) `STATUS_FIELD_NAME`: Configurable name for the status field (e.g., `ai_status`).
+*   (Target Documents) `STATUS_VALUES`: Configurable values for `in_progress`, `completed`, `failed`.
+
+### 8. Logging
+
+*   **Destination:** Standard Output (stdout).
+*   **Format:** Structured JSON.
+*   **Mandatory Fields per Log Entry:** `timestamp`, `level` (`INFO`, `WARN`, `ERROR`, `DEBUG`), `event` (string code), `message` (string).
+*   **Optional/Contextual Fields:** `job_id`, `openai_batch_id`, `custom_id`, `error_details`, `validation_errors`, `traceback`.
+*   **Key Events to Log:** API request received/responded, validation success/failure, file upload, OpenAI batch creation, polling script start/end, job polling status check, result/error file download, result processing start/end, output validation success/failure, document update success/failure, transient errors, retries, persistent errors after retries.
+
+### 9. Error Handling
+
+*   **API Input Validation:** Return `400 Bad Request` with structured JSON details.
+*   **Transient Errors (Polling Script):** Retry operations (OpenAI API calls, DB interactions) up to 3 times with exponential backoff. If still failing, log the error and skip processing that specific job for the current run.
+*   **OpenAI Batch Item Errors:** Reflected in the error file or error object in the results file. Mark the corresponding target document status as `failed`. Log the error details.
+*   **Output Schema Validation Failure:** Mark the corresponding target document status as `failed`. Do not update the `event_response` field. Log the validation error details.
+*   **Critical Polling Script Errors:** Log detailed error including traceback. The script should attempt to continue processing other jobs if possible.
+
+### 10. Testing Strategy
+
+*   **Unit Tests:**
+    *   Test JSONL line parsing and validation logic.
+    *   Test JSON Schema validation utility.
+    *   Test Pydantic model generation from JSON Schema string.
+    *   Test API request validation logic (mock external services).
+    *   Test polling script's job selection query.
+    *   Test result processing logic (parsing, validation, generating DB updates) with mock data.
+    *   Test retry mechanism logic.
+*   **Integration Tests:**
+    *   **API:** Send various valid/invalid requests (`multipart/form-data`) to the running API endpoint. Mock OpenAI API calls. Verify responses (`202`, `400`). Verify correct document creation in `batch_jobs` collection. Verify initial status updates in target collection (using a test DB).
+    *   **Polling Script:** Set up `batch_jobs` collection with various job states. Mock OpenAI API to return different statuses (`completed`, `failed`, `in_progress`, etc.) and mock result/error file content. Run the polling script. Verify status updates in `batch_jobs`. Verify correct processing of results, including schema validation and updates/status changes in the target collection (test DB). Test error handling and retry logic by mocking transient API failures.
+*   **End-to-End Tests (Optional):** If feasible, run the entire flow against a test OpenAI environment and a dedicated test MongoDB instance with a small, controlled batch input. Verify the final state matches expectations.
+*   **Performance Tests:** Simulate high load on the API endpoint. Simulate a large number of active jobs for the polling script. Measure response times and processing throughput. Monitor resource usage.
+
+---
